@@ -18,8 +18,8 @@ DTYPE = torch.float32 # float16
 
 # Paths
 BASIN_JSON_PATH = r'data/watershed_processed/FromGIS_d2k2_eqdx_20m.json' 
-HDF5_OUTPUT_PATH_phase1 = r'data/output/eqdx_d2k2_phase1_20m.hdf5'
-HDF5_OUTPUT_PATH_phase2 = r'data/output/eqdx_d2k2_phase2_20m.hdf5' 
+HDF5_OUTPUT_PATH_phase1 = r'data/output/eqdx_d2k2_phase1_20m_V100.hdf5'
+HDF5_OUTPUT_PATH_phase2 = r'data/output/eqdx_d2k2_phase2_20m_V100.hdf5' 
 
 
 ## Tao: Q_peak of channel 64 with dx=20m is 5% larger than that of dx=10m
@@ -93,6 +93,7 @@ def main_simulation_run():
     print(f"Watershed loaded: {len(watershed_manager.element_modules)} element modules created.")
     # --- Save Resolved Configuration ---
     config_output_filename = os.path.splitext(HDF5_OUTPUT_PATH_phase2)[0] + "_resolved_config.json"
+    print(f"---- DEBUG: {config_output_filename}--------")
     save_simulation_configuration(
         filepath=config_output_filename,
         simulation_settings=SIMULATION_SETTINGS,
