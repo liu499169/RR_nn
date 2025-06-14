@@ -48,6 +48,7 @@ class PlaneElement_(nn.Module):
         self.register_buffer('F_cumulative', torch.tensor(0.0, device=self.device, dtype=self.dtype))
         self.register_buffer('drying_cumulative', torch.tensor(0.0, device=self.device, dtype=self.dtype))
 
+    @torch.compile
     def forward(self, 
                 current_rain_rate_ms_tensor: torch.Tensor, # Scalar tensor
                 dt_s_tensor: torch.Tensor,                 # Scalar tensor

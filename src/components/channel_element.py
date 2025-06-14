@@ -36,6 +36,7 @@ class ChannelElement_(nn.Module):
         self.register_buffer('F_cumulative', torch.tensor(0.0, device=self.device, dtype=self.dtype))
         self.register_buffer('drying_cumulative', torch.tensor(0.0, device=self.device, dtype=self.dtype)) # 
 
+    @torch.compile
     def forward(self, 
                 current_rain_rate_ms_tensor: torch.Tensor,    # Scalar tensor
                 upstream_q_total_tensor: torch.Tensor,        # Scalar tensor (total Q m^3/s)
