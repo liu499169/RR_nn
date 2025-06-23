@@ -4,7 +4,7 @@ import torch.nn as nn
 
 # Import from our defined structures and core physics/solvers
 from src.data_structures import ElementProperties, SoilPropertiesIntermediate, OverlandFlowState, InfiltrationState
-from src.core.infiltration import infiltration_step_intermediate
+from src.core.infiltration import infiltration_step_intermediate, infiltration_step_intermediate_
 from src.core.kinematic_wave_solvers import explicit_step_lax_friedrichs # Specific solver for planes
 from src.core.kinematic_wave_solvers import explicit_muscl_yu_duan_with_plane_contrib
 from src.core.physics_formulas import (get_plane_h_from_area, calculate_q_manning, calculate_froude_number,
@@ -48,7 +48,7 @@ class PlaneElement_(nn.Module):
         self.register_buffer('F_cumulative', torch.tensor(0.0, device=self.device, dtype=self.dtype))
         self.register_buffer('drying_cumulative', torch.tensor(0.0, device=self.device, dtype=self.dtype))
 
-    @torch.compile
+    # @torch.compile
     def forward(self, 
                 current_rain_rate_ms_tensor: torch.Tensor, # Scalar tensor
                 dt_s_tensor: torch.Tensor,                 # Scalar tensor
@@ -80,7 +80,7 @@ class PlaneElement_(nn.Module):
         head_input_for_infil = self.depth.mean() if self.props.num_nodes > 0 else \
                                torch.tensor(0.0, device=self.device, dtype=self.dtype)
 
-        updated_infil_state, infil_rate_tensor_ms, infil_depth_tensor_m = infiltration_step_intermediate(
+        updated_infil_state, infil_rate_tensor_ms, infil_depth_tensor_m = infiltration_step_intermediate_(
             state=current_internal_infil_state, 
             params=self.soil_params, 
             rain_rate=current_rain_rate_ms_tensor,
@@ -178,7 +178,7 @@ class PlaneElement_(nn.Module):
         return outflow_q_tensor, infil_rate_tensor_ms, infil_depth_tensor_m
 
 class PlaneElement(nn.Module):
-    def __init__(self, 
+    def __init__(self,
                  element_props: ElementProperties, 
                  soil_params: SoilPropertiesIntermediate,
                  device: torch.device, # device and dtype are now primarily for buffer initialization

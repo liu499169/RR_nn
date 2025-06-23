@@ -82,7 +82,7 @@ class ChannelElement_(nn.Module):
             q_lat_surface_head = self.depth * avg_tw
             q_lat_nodes_prcp = current_rain_rate_ms_tensor.expand(self.props.num_nodes) * avg_tw 
             q_lat_nodes_infil = infil_rate_tensor_ms.expand(self.props.num_nodes) * avg_tw 
-            # q_lat_nodes_precip_expanded = q_lat_nodes_precip.expand(self.props.num_nodes)
+            # q_lat_nodes_precip_expanded = q_lat_nodes_prcp.expand(self.props.num_nodes)
             q_lat = torch.clamp(q_lat_surface_head/dt_s_tensor +  q_lat_nodes_prcp - q_lat_nodes_infil, min=0.0)
         else:
             q_lat = torch.empty(0, device=self.device, dtype=self.dtype)
@@ -115,25 +115,25 @@ class ChannelElement_(nn.Module):
             self.discharge.copy_(calculate_q_manning(self.area, wp_next, self.props.MAN, self.props.SL))
             
             outflow_q_tensor = self.discharge[-1]
-        elif self.props.num_nodes == 1: # Simplified storage update for 1-node channel
-             # Inflow = upstream_Q + plane_lateral_Q (total) + q_lat_nodes_precip_expanded[0] * LEN
-             # Outflow = Q_manning(A_curr)
-             # d(Area*LEN)/dt = Inflow - Outflow
-             q_in_total = upstream_q_total_tensor + plane_lateral_q_total_tensor + \
-                          (q_lat_nodes_precip_expanded[0] * self.props.LEN if q_lat_nodes_precip_expanded.numel()>0 else torch.tensor(0.0, device=self.device, dtype=self.dtype))
+        # elif self.props.num_nodes == 1: # Simplified storage update for 1-node channel
+        #      # Inflow = upstream_Q + plane_lateral_Q (total) + q_lat_nodes_precip_expanded[0] * LEN
+        #      # Outflow = Q_manning(A_curr)
+        #      # d(Area*LEN)/dt = Inflow - Outflow
+        #      q_in_total = upstream_q_total_tensor + plane_lateral_q_total_tensor + \
+        #                   (q_lat_nodes_precip_expanded[0] * self.props.LEN if q_lat_nodes_precip_expanded.numel()>0 else torch.tensor(0.0, device=self.device, dtype=self.dtype))
              
-             # Current outflow (approximate for single cell)
-             wp_curr = get_trapezoid_wp_from_h(self.depth, self.props.W0_nodes, self.props.SS1, self.props.SS2)
-             q_out_curr = calculate_q_manning(self.area, wp_curr, self.props.MAN, self.props.SL)
+        #      # Current outflow (approximate for single cell)
+        #      wp_curr = get_trapezoid_wp_from_h(self.depth, self.props.W0_nodes, self.props.SS1, self.props.SS2)
+        #      q_out_curr = calculate_q_manning(self.area, wp_curr, self.props.MAN, self.props.SL)
 
-             delta_A = (q_in_total - q_out_curr) * (dt_s_tensor / self.props.LEN) if self.props.LEN > 0 else torch.tensor(0.0, device=self.device, dtype=self.dtype)
-             self.area.copy_(torch.clamp(self.area + delta_A, min=0.0))
-             self.depth.copy_(get_h_from_trapezoid_area(self.area, self.props.W0_nodes, self.props.SS1, self.props.SS2))
-             wp_next = get_trapezoid_wp_from_h(self.depth, self.props.W0_nodes, self.props.SS1, self.props.SS2)
-             self.discharge.copy_(calculate_q_manning(self.area, wp_next, self.props.MAN, self.props.SL))
-             outflow_q_tensor = self.discharge[-1]
+        #      delta_A = (q_in_total - q_out_curr) * (dt_s_tensor / self.props.LEN) if self.props.LEN > 0 else torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        #      self.area.copy_(torch.clamp(self.area + delta_A, min=0.0))
+        #      self.depth.copy_(get_h_from_trapezoid_area(self.area, self.props.W0_nodes, self.props.SS1, self.props.SS2))
+        #      wp_next = get_trapezoid_wp_from_h(self.depth, self.props.W0_nodes, self.props.SS1, self.props.SS2)
+        #      self.discharge.copy_(calculate_q_manning(self.area, wp_next, self.props.MAN, self.props.SL))
+        #      outflow_q_tensor = self.discharge[-1]
 
-             dx_segment_tensor_for_cfl = self.props.LEN
+        #      dx_segment_tensor_for_cfl = self.props.LEN
 
         else: # num_nodes == 0
             outflow_q_tensor = torch.tensor(0.0, device=self.device, dtype=self.dtype)
