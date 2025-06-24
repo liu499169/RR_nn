@@ -3,12 +3,118 @@ import torch
 import torch.nn as nn
 
 from src.data_structures import ElementProperties, SoilPropertiesIntermediate, OverlandFlowState, InfiltrationState
-from src.core.infiltration import infiltration_step_intermediate
+from src.core.infiltration import infiltration_step_intermediate, infiltration_step_intermediate_
+from src.core.implicit_solver import ImplicitKinematicWave
 from src.core.kinematic_wave_solvers import explicit_muscl_yu_duan_with_plane_contrib
 from src.core.physics_formulas import (get_h_from_trapezoid_area, get_trapezoid_wp_from_h,
                                        get_trapezoid_topwidth_from_h, calculate_q_manning,
                                        calculate_froude_number, calculate_cfl_number)
-# @torch.compile
+
+class ChannelElement_im(nn.Module):
+    def __init__(self, 
+                 props: ElementProperties, 
+                 soil_params: SoilPropertiesIntermediate,
+                 device: torch.device, 
+                 dtype: torch.dtype):
+        super().__init__()
+        
+        # Store Properties and Parameters (assumed to be on correct device/dtype)
+        self.props: ElementProperties = props # self._move_props_to_device(props, device, dtype)
+        self.soil_params: SoilPropertiesIntermediate = soil_params # self._move_soil_params_to_device(soil_params, device, dtype)
+        
+        self.device = device
+        self.dtype = dtype
+
+        # --- Initialize State Buffers ---
+        self.register_buffer('area', torch.zeros(self.props.num_nodes, device=self.device, dtype=self.dtype))
+        self.register_buffer('depth', torch.zeros(self.props.num_nodes, device=self.device, dtype=self.dtype))
+        self.register_buffer('discharge', torch.zeros(self.props.num_nodes, device=self.device, dtype=self.dtype))
+        self.register_buffer('t_elapsed', torch.tensor(0.0, device=self.device, dtype=self.dtype))
+        self.register_buffer('max_cfl', torch.tensor(0.0, device=device, dtype=dtype))
+
+        init_theta = self.soil_params.theta_init_condition.clone().detach()
+        self.register_buffer('theta_current', init_theta)
+        self.register_buffer('F_cumulative', torch.tensor(0.0, device=self.device, dtype=self.dtype))
+        self.register_buffer('drying_cumulative', torch.tensor(0.0, device=self.device, dtype=self.dtype)) # 
+
+    # @torch.compile
+    def forward(self, 
+                current_rain_rate_ms_tensor: torch.Tensor,    # Scalar tensor
+                upstream_q_total_tensor: torch.Tensor,        # Scalar tensor (total Q m^3/s)
+                plane_lateral_q_total_tensor: torch.Tensor,   # Scalar tensor (total Q m^3/s from side planes)
+                dt_s_tensor: torch.Tensor,                    # Scalar tensor
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # outflow_q, infil_rate, infil_depth
+        """
+        Performs one time step update for the channel element.
+        Updates internal states. Returns key results.
+        """
+
+        # --- 1. Infiltration (still explicit, calculated for the whole dt) ---
+        current_internal_infil_state = InfiltrationState(
+            theta_current=self.theta_current, 
+            F_cumulative=self.F_cumulative,
+            drying_cumulative=self.drying_cumulative
+        )
+
+        # Infiltration is solved per-node to account for varying water depth        
+        updated_infil_state, infil_rate_nodes, infil_depth_nodes = \
+        infiltration_step_intermediate_(
+            state=current_internal_infil_state, 
+            params=self.soil_params,
+            rain_rate=current_rain_rate_ms_tensor, 
+            surface_head=self.depth, #head_input_for_infil,
+            dt=dt_s_tensor, 
+            cumulative_rain_start=self.F_cumulative
+        )
+        self.theta_current.copy_(updated_infil_state.theta_current)
+        self.F_cumulative.copy_(updated_infil_state.F_cumulative)
+        self.drying_cumulative.copy_(updated_infil_state.drying_cumulative)
+
+        # --- 2. Prepare Inputs for the Implicit Routing Solver ---
+        # --- Lateral Inflow for Solver (from direct precipitation on channel surface) ---   
+        top_width_nodes = get_trapezoid_topwidth_from_h(
+            self.depth, self.props.W0_nodes, self.props.SS1, self.props.SS2)
+        
+        net_rain_rate_nodes = torch.clamp(current_rain_rate_ms_tensor.expand_as(infil_rate_nodes) - infil_rate_nodes, min=0.0)
+        q_lat_from_rain = net_rain_rate_nodes * top_width_nodes
+
+        # Distribute the total lateral inflow from planes evenly along the element length
+        q_lat_from_planes = (plane_lateral_q_total_tensor / self.props.LEN) if self.props.LEN > 0 else 0.0
+
+        q_lateral_total = q_lat_from_rain + q_lat_from_planes
+        
+        # # Collect learnable parameters (those that are torch.Tensors and require gradients)
+        # learnable_params = {k: v for k, v in self.props.__dict__.items()
+        #             if isinstance(v, torch.Tensor) and v.requires_grad}
+
+        # --- 3. Call the Implicit Solver ---
+        A_next = ImplicitKinematicWave.apply(
+            ctx,
+            self.area,
+            upstream_q_total_tensor,
+            q_lateral_total,
+            dt_s_tensor,
+            self.props,
+            self.props.MAN 
+        )
+        
+        # --- 4. Update internal state buffers with the solver's result ---
+        self.area.copy_(A_next)
+
+        # Re-calculate depth and discharge based on the new flow area
+        self.depth.copy_(get_h_from_trapezoid_area(self.area, self.props.W0_nodes, self.props.SS1, self.props.SS2))
+        wp_next = get_trapezoid_wp_from_h(self.depth, self.props.W0_nodes, self.props.SS1, self.props.SS2)
+        self.discharge.copy_(calculate_q_manning(self.area, wp_next, self.props.MAN, self.props.SL))
+        
+        # Update elapsed time
+        self.t_elapsed.copy_(self.t_elapsed + dt_s_tensor)
+
+        # --- 5. Calculate Outflow ---
+        outflow_q_tensor = self.discharge[-1]
+        
+        return outflow_q_tensor, infil_rate_nodes, infil_depth_nodes
+
+
 class ChannelElement_(nn.Module):
     def __init__(self, 
                  props: ElementProperties, 

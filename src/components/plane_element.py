@@ -5,12 +5,152 @@ import torch.nn as nn
 # Import from our defined structures and core physics/solvers
 from src.data_structures import ElementProperties, SoilPropertiesIntermediate, OverlandFlowState, InfiltrationState
 from src.core.infiltration import infiltration_step_intermediate, infiltration_step_intermediate_
-from src.core.kinematic_wave_solvers import explicit_step_lax_friedrichs # Specific solver for planes
+from src.core.implicit_solver import ImplicitKinematicWave
 from src.core.kinematic_wave_solvers import explicit_muscl_yu_duan_with_plane_contrib
 from src.core.physics_formulas import (get_plane_h_from_area, calculate_q_manning, calculate_froude_number,
                                        calculate_cfl_number, get_trapezoid_wp_from_h)    
 
-# @torch.compile
+class PlaneElement_im(nn.Module):
+    def __init__(self, 
+                 element_props: ElementProperties, 
+                 soil_params: SoilPropertiesIntermediate,
+                 device: torch.device, # device and dtype are now primarily for buffer initialization
+                 dtype: torch.dtype):
+        super().__init__()
+
+        # --- Store Properties and Parameters ---
+
+        self.props: ElementProperties = element_props
+        self.soil_params: SoilPropertiesIntermediate = soil_params
+        self.device = device
+        self.dtype = dtype
+
+        # --- Initialize State Buffers ---
+        # Buffers are part of the module's state_dict, move with .to(device), but are not parameters.
+        
+        # Flow State
+        # Initial area, depth, discharge are zeros. t_elapsed is zero.
+        zero_tensor = torch.zeros(self.props.num_nodes, device=self.device, dtype=self.dtype)
+        self.register_buffer('area', zero_tensor)
+        self.register_buffer('depth', zero_tensor)
+        self.register_buffer('discharge', zero_tensor)
+        self.register_buffer('t_elapsed', torch.tensor(0.0, device=self.device, dtype=self.dtype))
+        self.register_buffer('max_cfl', torch.tensor(0.0, device=device, dtype=dtype))
+
+        # Infiltration State
+        # Initial theta_current is from soil_params.theta_init_condition. F_cumulative is zero.
+        # Ensure soil_params.theta_init_condition is a tensor. It should be from basin_loader.
+        init_theta = self.soil_params.theta_init_condition.clone().detach() # Clone for safety
+        init_theta = zero_tensor + init_theta.item() # Ensure correct device/dtype
+        self.register_buffer('theta_current', init_theta)
+        self.register_buffer('F_cumulative', zero_tensor)
+        self.register_buffer('drying_cumulative', zero_tensor)
+
+    # @torch.compile
+    def forward(self, 
+                current_rain_rate_ms_tensor: torch.Tensor, # Scalar tensor
+                dt_s_tensor: torch.Tensor,                 # Scalar tensor
+                # cumulative_rain_m_start_tensor: torch.Tensor # Scalar tensor
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Performs one time step update for the plane element.
+        Updates internal state buffers.
+
+        Args:
+            current_rain_rate_ms_tensor (torch.Tensor): Rainfall rate for this step (m/s).
+            dt_s_tensor (torch.Tensor): Timestep duration (s).
+            cumulative_rain_m_start_tensor (torch.Tensor): Cumulative rain up to start of step (m).
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
+                - outflow_q_tensor (torch.Tensor): Discharge from the last node (m^3/s), scalar tensor.
+                - infil_rate_tensor_ms (torch.Tensor): Infiltration rate for the step (m/s), scalar tensor.
+                - infil_depth_tensor_m (torch.Tensor): Infiltration depth for the step (m), scalar tensor.
+        """
+        # Current states from buffers
+        current_internal_infil_state = InfiltrationState(
+            theta_current=self.theta_current, 
+            F_cumulative=self.F_cumulative,
+            drying_cumulative=self.drying_cumulative
+        )
+        
+        # --- Infiltration ---
+        updated_infil_state, infil_rate_tensor_ms, infil_depth_tensor_m = \
+        infiltration_step_intermediate_(
+            state=current_internal_infil_state, 
+            params=self.soil_params, 
+            rain_rate=current_rain_rate_ms_tensor,
+            surface_head=self.depth, 
+            dt=dt_s_tensor, 
+            cumulative_rain_start=self.F_cumulative
+        )
+        # Update infiltration state buffers
+        # print(f"--- DEBUG: Updated theta_current: {updated_infil_state.theta_current}")
+        self.theta_current.copy_(updated_infil_state.theta_current) # In-place update of buffer
+        self.F_cumulative.copy_(updated_infil_state.F_cumulative)   # In-place update
+        self.drying_cumulative.copy_(updated_infil_state.drying_cumulative) # Update cumulative drying 
+
+        # --- Lateral Inflow for Solver (from net precipitation) ---
+        # q_lat_nodes_precip is per unit length (m^2/s)
+        current_rain_rate = current_rain_rate_ms_tensor.expand_as(infil_rate_tensor_ms)
+        net_rain_rate_tensor = torch.clamp(current_rain_rate - infil_rate_tensor_ms, min=0.0)
+        
+        # Calculate lateral inflow at nodes
+        q_lat_nodes_precip = net_rain_rate_tensor * self.props.WID 
+        
+        # if self.props.num_nodes > 0:
+        #     q_lat_nodes_precip_expanded = q_lat_nodes_precip.repeat(self.props.num_nodes)
+        # else: # Should ideally not happen for a simulated element
+        #     q_lat_nodes_precip_expanded = torch.empty(0, device=self.device, dtype=self.dtype)
+
+        zero_upstream_q_tensor = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        # --- Overland Flow Solver () ---
+        # Solvers require num_nodes >= 2 typically. If num_nodes < 2, handle gracefully.
+        if self.props.num_nodes >= 2:
+            # print(f"--- DEBUG: Using explicit_muscl_yu_duan_with_plane_contrib solver for {self.props.num_nodes} nodes")
+            # print(f"--- DEBUG: {self.props.element_id} - Area before solver: {self.area}")
+            # print(f"--- DEBUG: {self.props.element_id} - lateral q: {q_lat_nodes_precip}")
+            if torch.sum(self.area) < 1e-6:
+                # If area is zero, we need to handle this case
+                A_next = self.area + dt_s_tensor * q_lat_nodes_precip
+
+            else:
+                A_next = ImplicitKinematicWave.apply(
+                    self.area,
+                    zero_upstream_q_tensor,
+                    q_lat_nodes_precip,
+                    dt_s_tensor,
+                    self.props,
+                    self.props.MAN 
+                )
+            
+            # Update flow state buffers
+            self.area.copy_(A_next) # In-place update
+            self.depth.copy_(get_plane_h_from_area(self.area, self.props.WID)) # WID is tensor
+            
+            wp_next = torch.full_like(self.area, self.props.WID.item()) 
+            self.discharge.copy_(calculate_q_manning(self.area, wp_next, self.props.MAN, self.props.SL))
+            
+            outflow_q_tensor = self.discharge[-1]
+        elif self.props.num_nodes == 1: # Handle 1-node elements with a simple storage update
+            
+            if q_lat_nodes_precip.numel() > 0:
+                self.area.copy_(torch.clamp(self.area + dt_s_tensor * q_lat_nodes_precip[0], min=0.0))
+            self.depth.copy_(get_plane_h_from_area(self.area, self.props.WID))
+            wp_next = torch.full_like(self.area, self.props.WID)
+            self.discharge.copy_(calculate_q_manning(self.area, wp_next, self.props.MAN, self.props.SL))
+            outflow_q_tensor = self.discharge[-1] # Indexing will work for single element tensor
+
+        else: # num_nodes == 0
+            outflow_q_tensor = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+            # States (area, depth, discharge) remain empty or zeros
+
+        self.t_elapsed.copy_(self.t_elapsed + dt_s_tensor) # In-place update
+
+        return outflow_q_tensor, infil_rate_tensor_ms, infil_depth_tensor_m
+
+
 class PlaneElement_(nn.Module):
     def __init__(self, 
                  element_props: ElementProperties, 

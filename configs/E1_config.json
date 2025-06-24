@@ -1,0 +1,35 @@
+{
+  "EVENT_ID": "E2008_1",
+  "EVENT_DATE": "Jan05",
+  "EVENT_NAME_HDF": "E2008_1_Jan05",
+  "PREPARED_RAINFALL_PATH": "data/Events/uAS/E2008_1_Jan05_prepared.h5",
+  "BASIN_JSON_PATH": "data/watershed_processed/FromGIS_d2k2_eqdx_20m.json",
+  "HDF5_OUTPUT_PATH_phase1": "data/output/E2008_1_Jan05_phase1.hdf5",
+  "HDF5_OUTPUT_PATH_phase2": "data/output/E2008_1_Jan05_phase2.hdf5",
+  "GLOBAL_PARAM_OVERRIDES": {
+    "plane": {
+      "MAN": 0.10,
+      "Ks": 0,
+      "Hf_max": 0,
+      "theta_init_condition": 0.1,
+      "m_exponent": 0,
+      "k_drain": 0e-07
+    },
+    "channel": {
+      "MAN": 0.06,
+      "Ks": 0,
+      "Hf_max": 0,
+      "theta_init_condition": 0.1,
+      "m_exponent": 0,
+      "k_drain": 0e-07
+    }
+  },
+  "LEARNABLE_PARAMS_LIST": ["man", "ks", "hf_max", "m_exponent"],
+  "SIMULATION_SETTINGS": {
+    "sim_duration_min": 60,
+    "save_interval_min": 1,
+    "max_dt_min": 1,
+    "min_dt_min": 9e-4,
+    "cfl_number": 0.9
+  }
+}

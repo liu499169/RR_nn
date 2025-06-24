@@ -1,6 +1,7 @@
 import os
 import torch
 import gc
+import json
 
 
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -18,31 +19,23 @@ else:
 DTYPE = torch.float32 # float16
 
 # Paths
-EVENT_ID = 'E2008_1'
-EVENT_DATE = 'Jan05'
-EVENT_NAME_HDF = f'{EVENT_ID}_{EVENT_DATE}'
-PREPARED_RAINFALL_PATH = f'data/Events/uAS/{EVENT_NAME_HDF}_prepared.h5'
+# Load configuration from external JSON file
+CONFIG_PATH = "configs/E1_config.json"
+with open(CONFIG_PATH, "r") as f:
+    config = json.loads(f)
 
-BASIN_JSON_PATH = r'data/watershed_processed/FromGIS_d2k2_eqdx_20m.json' 
-HDF5_OUTPUT_PATH_phase1 = f'data/output/{EVENT_NAME_HDF}_phase1.hdf5'
-HDF5_OUTPUT_PATH_phase2 = f'data/output/{EVENT_NAME_HDF}_phase2.hdf5'
+EVENT_ID = config['EVENT_ID']
+EVENT_DATE = config['EVENT_DATE']
+EVENT_NAME_HDF = f"{EVENT_ID}_{EVENT_DATE}"
+PREPARED_RAINFALL_PATH = config['PREPARED_RAINFALL_PATH'].format(EVENT_NAME_HDF=EVENT_NAME_HDF)
 
-# Global Parameter Overrides (values are Python floats/ints, basin_loader handles conversion)
-GLOBAL_PARAM_OVERRIDES = {
-    'plane':   {'MAN': 0.10, 'Ks': 0, 'Hf_max': 0, 'theta_init_condition': 0.1, 'm_exponent': 0, 'k_drain':0e-07}, 
-    'channel': {'MAN': 0.06, 'Ks': 0, 'Hf_max': 0, 'theta_init_condition': 0.1, 'm_exponent': 0, 'k_drain':0e-07}
-}
-# List of parameters to make learnable (case-insensitive matching in loader)
-LEARNABLE_PARAMS_LIST = ['man', 'ks', 'hf_max', 'm_exponent'] 
+BASIN_JSON_PATH = config['BASIN_JSON_PATH']
+HDF5_OUTPUT_PATH_phase1 = config['HDF5_OUTPUT_PATH_phase1'].format(EVENT_NAME_HDF=EVENT_NAME_HDF)
+HDF5_OUTPUT_PATH_phase2 = config['HDF5_OUTPUT_PATH_phase2'].format(EVENT_NAME_HDF=EVENT_NAME_HDF)
 
-# Simulation Settings
-SIMULATION_SETTINGS = {
-    'sim_duration_min': 1 * 60,    # Total simulation time
-    'cfl_number': 0.9, # Courant number
-    'max_dt_min': 5.0, # Optional Max allowed dt in minutes
-    'min_dt_min': 9e-3, # Optional Min allowed dt in minutes
-    'save_interval_min': 5.0     # How often to save results to HDF5
-}
+GLOBAL_PARAM_OVERRIDES = config['GLOBAL_PARAM_OVERRIDES']
+LEARNABLE_PARAMS_LIST = config['LEARNABLE_PARAMS_LIST']
+SIMULATION_SETTINGS = config['SIMULATION_SETTINGS']
 
 # --- End Configuration ---
 
@@ -59,6 +52,7 @@ from src.core.physics_formulas import (get_h_from_trapezoid_area, get_plane_h_fr
                                         calculate_q_manning, calculate_froude_number, calculate_cfl_number)
 
 from torch.profiler import profile, ProfilerActivity
+import json
 
 def main_simulation_run():
     print(f"--- Main Simulation Script ---")

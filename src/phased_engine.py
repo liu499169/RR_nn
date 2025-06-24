@@ -7,7 +7,7 @@ from tqdm import tqdm
 from collections import defaultdict
 
 from src.data_structures import ElementProperties, OverlandFlowState, InfiltrationState
-from src.watershed import Watershed, Watershed_
+from src.watershed import Watershed, Watershed_, Watershed_im
 from src.io.event_loader import PreloadedRainfallManager, AbstractRainfallManager
 from src.io.results_handler import ResultSaver, ResultSaver_v2
 from src.core.physics_formulas import (get_plane_h_from_area, calculate_q_manning, 
@@ -15,8 +15,8 @@ from src.core.physics_formulas import (get_plane_h_from_area, calculate_q_mannin
                                        get_h_from_trapezoid_area, get_trapezoid_wp_from_h,
                                        get_trapezoid_topwidth_from_h) # etc.
 from src.utils.rainfall_generator import generate_triangular_rainfall
-from src.components.plane_element import PlaneElement, PlaneElement_ # For isinstance check
-from src.components.channel_element import ChannelElement, ChannelElement_ # For isinstance check
+from src.components.plane_element import PlaneElement, PlaneElement_, PlaneElement_im # For isinstance check
+from src.components.channel_element import ChannelElement, ChannelElement_, ChannelElement_im # For isinstance check
 
 
 EPSILON = 1e-9
@@ -563,8 +563,8 @@ class PhasedSimulationEngine_v2:
     @staticmethod
     def _calculate_total_infiltration_volume(module_list: list, device, dtype) -> torch.Tensor:
         """Calculates total infiltration volume across all elements."""
-        total_infiltration_volume_planes = torch.tensor(0.0, device=device, dtype=dtype)
-        total_infiltration_volume_channels = torch.tensor(0.0, device=device, dtype=dtype)
+        planes_vol = torch.tensor(0.0, device=device, dtype=dtype)
+        chans_vol = torch.tensor(0.0, device=device, dtype=dtype)
         for module in module_list:
             # print(f"Cumulative infiltration for element {module.props.element_id}: {module.F_cumulative.item()}")
             props = module.props
@@ -891,6 +891,7 @@ class PhasedSimulationEngine_v2:
 
         # Use the main HDF5 saver for Phase 2 outputs
         save_interval_s_phase2 = self.sim_settings['save_interval_min'] * 60.0
+        next_save_time_float = save_interval_s_phase2 if save_interval_s_phase2 >= 0 else float('inf')
 
         current_time_s_float = 0.0
         cumulative_rain_m_tensor = torch.tensor(0.0, device=self.device, dtype=self.dtype) # Separate for channels
@@ -1042,6 +1043,312 @@ class PhasedSimulationEngine_v2:
         final_soil_moisture_storage_channels = self._calculate_overall_soil_moisture_storage(channel_modules)
         final_infil_volume_planes, final_infil_volume_channels, final_infil_volume_basin = \
             self._calculate_total_infiltration_volume(channel_modules)
+        
+        final_surface_storage_end = self.phase1_results['final_surface_storage_planes'] + final_surface_storage_channels
+        final_soil_moisture_storage_end = self.phase1_results['final_soil_moisture_storage_planes'] + final_soil_moisture_storage_channels
+        
+        delta_surface = final_surface_storage_end - self.initial_surface_storage_basin
+        delta_soil = final_soil_moisture_storage_end - self.initial_soil_moisture_storage_basin
+        
+        total_change_and_outflow = self.total_outlet_flow_volume_basin + delta_surface + delta_soil
+        error_abs = self.total_precip_volume_basin - total_change_and_outflow
+        error_rel = (error_abs / (self.total_precip_volume_basin + EPSILON)) * 100.0
+
+        print("\n--- Overall Mass Balance Summary (Decoupled) ---")
+        print(f"  Total Precipitation Volume: {self.total_precip_volume_basin.item():.4f} m^3")
+        print(f"  Total Infiltration (Planes): {final_infil_volume_planes.item():.4f} m^3")
+        print(f"  Total Infiltration (Channels): {final_infil_volume_channels.item():.4f} m^3")
+        print(f"  Total Infiltration (Combined): {final_infil_volume_basin.item():.4f} m^3")
+        print(f"  Total Basin Outlet Flow:    {self.total_outlet_flow_volume_basin.item():.4f} m^3")
+        print(f"  Change in Surface Storage:  {delta_surface.item():.4f} m^3")
+        print(f"  Change in Soil Storage:     {delta_soil.item():.4f} m^3")
+        print(f"  Sum of Outputs & Storage Change: {total_change_and_outflow.item():.4f} m^3")
+        print(f"  Mass Balance Error (In - Out): {error_abs.item():.4f} m^3 ({error_rel.item():.4f} %)")
+
+
+class PhasedSimulationEngine_v3: # using the implicit solver
+    def __init__(self,
+                 watershed_obj: Watershed_im,
+                 rainfall_manager: AbstractRainfallManager,
+                 result_saver_planes: ResultSaver_v2, 
+                 result_saver_channels: ResultSaver_v2, 
+                 simulation_settings: dict,
+                 device: torch.device,
+                 dtype: torch.dtype,
+                 phase1_results: dict = None):
+        
+        self.watershed = watershed_obj
+        self.rainfall_manager = rainfall_manager
+        self.result_saver_planes = result_saver_planes
+        self.phase1_results = phase1_results
+        self.result_saver_channels = result_saver_channels
+        self.sim_settings = simulation_settings
+        self.device = device
+        self.dtype = dtype
+        self.phase1_results = phase1_results
+
+        self.sim_duration_s = self.sim_settings['sim_duration_min'] * 60.0
+        self.save_interval_s = self.sim_settings['save_interval_min'] * 60.0
+
+        self.total_plane_area = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        self.total_channel_surface_area = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        for module in self.watershed.element_modules.values():
+            props = module.props
+            if isinstance(module, PlaneElement):
+                self.total_plane_area += props.LEN * props.WID
+            elif isinstance(module, ChannelElement):
+                self.total_channel_surface_area += props.LEN * props.WID
+        self.total_precip_receiving_area = self.total_plane_area + self.total_channel_surface_area
+
+        # --- Mass Balance Initialization ---
+        self.total_precip_volume_basin = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        self.total_outlet_flow_volume_basin = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        if self.phase1_results:
+            print("Phase 2 Engine initialized with mass balance state from Phase 1.")
+            self.total_precip_volume_basin += self.phase1_results['precip_volume']
+            self.initial_surface_storage_basin = self.phase1_results['initial_surface_storage']
+            self.initial_soil_moisture_storage_basin = self.phase1_results['initial_soil_moisture_storage']
+        else:
+            print("Phase 1 Engine: Calculating initial basin storage.")
+            all_modules = list(self.watershed.element_modules.values())
+            self.initial_surface_storage_basin = self._calculate_overall_surface_storage(all_modules)
+            self.initial_soil_moisture_storage_basin = self._calculate_overall_soil_moisture_storage(all_modules)
+        
+        print(f"  Total calculated plane area: {self.total_plane_area.item() / 1e6:.2f} km^2")
+        print(f"  Total precipitation receiving area: {self.total_precip_receiving_area.item() / 1e6:.2f} km^2")
+        print(f"  Initial surface storage (m^3): {self.initial_surface_storage_basin.item():.2f}")
+        print(f"  Initial soil moisture storage (m^3): {self.initial_soil_moisture_storage_basin.item():.2f}")
+
+    def _calculate_total_infiltration_volume(self, module_list: list, device, dtype) -> torch.Tensor:
+        """Calculates total infiltration volume across all elements."""
+        planes_vol = torch.tensor(0.0, device=device, dtype=dtype)
+        chans_vol = torch.tensor(0.0, device=device, dtype=dtype)
+        for module in module_list:
+            # print(f"Cumulative infiltration for element {module.props.element_id}: {module.F_cumulative.item()}")
+            props = module.props
+            if isinstance(module, PlaneElement_):
+                planes_vol += module.F_cumulative * props.LEN * props.WID
+            elif isinstance(module, ChannelElement_):
+                chans_vol  += module.F_cumulative * props.WID * props.LEN
+        total_infiltration_volume = planes_vol + chans_vol 
+        return planes_vol, chans_vol, total_infiltration_volume
+
+    def _calculate_overall_surface_storage(self, module_list: list) -> torch.Tensor:
+        total_storage = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        for module in module_list:
+            props = module.props 
+            if props.num_nodes > 0 and props.dx_segments.numel() > 0:
+                total_storage += torch.sum(module.area[:-1] * props.dx_segments)
+        return total_storage
+    
+    def _calculate_overall_soil_moisture_storage(self, module_list: list) -> torch.Tensor:
+        zero_tensor = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        drying_storage = zero_tensor
+        total_storage = zero_tensor
+        for module in module_list:
+            props = module.props
+            soil_p = module.soil_params
+            element_surface_area = props.LEN * props.WID
+            drying_storage += torch.sum(module.drying_cumulative * soil_p.effective_depth * element_surface_area) 
+            total_storage += torch.sum(module.theta_current.mean() * soil_p.effective_depth * element_surface_area )
+        return total_storage - drying_storage
+
+    def _run_phase1_planes(self):
+        print("--- Starting Phase 1: Independent Plane Simulations ---")
+        plane_modules = []
+        for m in self.watershed.element_modules.values():
+            # print(f"Checking module {m.props.element_id} of type {type(m)}")
+            if isinstance(m, PlaneElement_im):
+                plane_modules.append(m)
+
+        print(f"Found {len(plane_modules)} plane elements for Phase 1.")
+
+        if not plane_modules:
+            print("No plane elements found for Phase 1.")
+            return {}
+        
+        dt_s = self.sim_settings['fixed_dt_min'] * 60.0
+        num_steps = int(self.sim_duration_s / dt_s)
+        dt_tensor = torch.tensor(dt_s, device=self.device, dtype=self.dtype)
+
+        total_precip_volume_basin_phase1 = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        hydrographs_to_save = {p.props.element_id: ([], []) for p in plane_modules}
+
+        # Initial state for hydrographs at t=0
+        for p in plane_modules:
+            hydrographs_to_save[p.props.element_id][0].append(0.0)
+            hydrographs_to_save[p.props.element_id][1].append(p.discharge[-1].item()
+                                                              if p.props.num_nodes > 0 else 0.0)
+
+        pbar = tqdm(total=num_steps, desc="Phase 1 (Planes)", unit="steps")
+        for i in range(num_steps):
+            dt_float = i * dt_s 
+            element_rain_rates = self.rainfall_manager.get_rainfall_at_time(dt_float)            
+
+            for plane_module in plane_modules:
+                pid = plane_module.props.element_id
+                rain_for_this_element = element_rain_rates.get(pid, self.rainfall_manager.zero_rain_tensor)
+
+                with torch.amp.autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda')):
+                    outlet_q, p_infil_r, infil_d = plane_module(rain_for_this_element, dt_tensor)
+
+                hydrographs_to_save[pid][0].append(dt_float)
+                hydrographs_to_save[pid][1].append(outlet_q.item())
+                total_precip_volume_basin_phase1 += rain_for_this_element * plane_module.props.LEN * plane_module.props.WID * dt_tensor
+
+            pbar.update(1)
+        pbar.update(dt_float)
+
+        # Convert hydrograph lists to tensors
+        final_hydrographs = {pid: (torch.tensor(t_list), torch.tensor(q_list)) for pid, (t_list, q_list) in hydrographs_to_save.items()}
+            
+        mass_balance_results = {
+            'precip_volume': total_precip_volume_basin_phase1,
+            'initial_surface_storage': self.initial_surface_storage_basin,
+            'initial_soil_moisture_storage': self.initial_soil_moisture_storage_basin,
+            'final_surface_storage_planes': self._calculate_overall_surface_storage(plane_modules),
+            'final_soil_moisture_storage_planes': self._calculate_overall_soil_moisture_storage(plane_modules),
+            'final_infiltration_volume_planes': self._calculate_total_infiltration_volume(plane_modules)[0],
+        }
+        print(f"--- Phase 1 Finished ---")
+        return final_hydrographs, mass_balance_results
+
+    def _run_phase2_channels(self):
+        print("--- Starting Phase 2: Channel Network Routing ---")
+        channel_modules = [m for m in self.watershed.element_modules.values() if isinstance(m, ChannelElement_im)]
+        if not channel_modules:
+            print("No channel elements found for Phase 2.")
+            return
+
+        # Use the main HDF5 saver for Phase 2 outputs
+        save_interval_s_phase2 = self.sim_settings['save_interval_min'] * 60.0
+        next_save_time_float = save_interval_s_phase2 if save_interval_s_phase2 >= 0 else float('inf')
+
+        dt_s = self.sim_settings['fixed_dt_min'] * 60.0
+        num_steps = int(self.sim_duration_s / dt_s)
+        dt_tensor = torch.tensor(dt_s, device=self.device, dtype=self.dtype)
+
+        channel_outflows_this_step = {}
+        element_infil_rates_this_step: dict[int, float] = {}
+
+        pbar = tqdm(total=num_steps, desc="Phase 2 (Channels)", unit="steps")
+        for i in range(num_steps):
+            current_time_s_float = i * dt_s
+            element_rain_rates = self.rainfall_manager.get_rainfall_at_time(current_time_s_float)
+
+            time_idx = min(int(current_time_s_float), self.resampled_plane_q.shape[1] - 1)
+
+            
+            for group_id in self.watershed.simulation_order: # This order includes all groups
+                group_config = self.watershed.get_group_config(group_id)
+                if not group_config or not group_config['channel']: continue # Skip if no channel in group
+
+                channel_eid = group_config['channel']
+                channel_module = self.watershed.get_element_module(channel_eid)
+                if not isinstance(channel_module, ChannelElement_): continue # Should not happen
+
+                # --- Upstream Channel Inflow ---
+                upstream_q_tensor = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+                for up_grp_id, down_grp_id in self.watershed.connectivity.items():
+                    if down_grp_id == group_id:
+                        upstream_q_tensor += channel_outflows_this_step.get(
+                            up_grp_id, torch.tensor(0.0))
+                
+                head_plane_q, side_plane_q = self._get_plane_inflows_for_group(group_id, time_idx)          
+                upstream_q_final_for_channel = upstream_q_tensor + head_plane_q
+
+                rain_for_channel = element_rain_rates.get(channel_eid, self.rainfall_manager.zero_rain_tensor)
+                
+                # --- Call Channel Forward ---
+                with torch.amp.autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda')):
+                    c_out_q, c_infil_r, c_infil_d = channel_module(
+                    rain_for_channel, upstream_q_final_for_channel,side_plane_q, dt_tensor)
+                
+                channel_outflows_this_step[group_id] = c_out_q
+                element_infil_rates_this_step[channel_eid] = c_infil_r.item()
+
+                # Mass balance accumulation
+                self.total_precip_volume_basin += rain_for_channel * channel_module.props.LEN * channel_module.props.WID * dt_tensor
+                if group_id not in self.watershed.connectivity:
+                    self.total_outlet_flow_volume_basin += c_out_q * dt_tensor
+
+            if save_interval_s_phase2 >=0 and current_time_s_float >= next_save_time_float - EPSILON:
+                all_current_states_for_saving = {
+                    eid: {'flow': OverlandFlowState(mod.t_elapsed.clone(), mod.area.clone(), mod.depth.clone(), 
+                                                    mod.discharge.clone(), mod.max_cfl.clone()),
+                          'infil': InfiltrationState(mod.theta_current.clone(), mod.F_cumulative.clone(), 
+                                                     mod.drying_cumulative.clone())}
+                    for eid, mod in self.watershed.element_modules.items() if isinstance(mod, ChannelElement_)
+                }
+                self.result_saver_channels.save_state(save_count_idx_phase2, current_time_s_float,
+                                             all_current_states_for_saving, element_infil_rates_this_step)
+                save_count_idx_phase2 += 1
+                next_save_time_float += save_interval_s_phase2
+
+            pbar.update(1)
+        pbar.close()
+        print(f"--- Phase 2 Finished ---")  # ({step_count} steps)
+
+    def load_and_resample_plane_hydrographs(self, hdf5_path: str):
+        print(f"Loading and resampling hydrographs from {hdf5_path}...")
+        with h5py.File(hdf5_path, 'r') as hf:
+            if "hydrographs" not in hf: raise ValueError("Hydrographs not in HDF5 file.")
+            plane_hydrographs = {int(k): (torch.from_numpy(v['time_s'][:]), torch.from_numpy(v['discharge_m3s'][:])) for k, v in hf['hydrographs'].items()}
+        
+        num_points = int(self.sim_duration_s) + 1
+        self.resampled_time_grid = torch.linspace(0, self.sim_duration_s, num_points, device=self.device, dtype=self.dtype)
+        
+        plane_ids = list(plane_hydrographs.keys())
+        self.resampled_plane_q = torch.zeros(len(plane_ids), num_points, device=self.device, dtype=self.dtype)
+        self.plane_id_to_idx_map = {pid: i for i, pid in enumerate(plane_ids)}
+
+        for i, pid in enumerate(plane_ids):
+            source_t, source_q = plane_hydrographs[pid]
+            source_t, source_q = source_t.to(self.device), source_q.to(self.device)
+            if source_t.numel() < 2: continue
+            
+            indices = torch.searchsorted(source_t, self.resampled_time_grid, right=True) - 1
+            indices.clamp_(0, source_t.numel() - 2)
+            t0, t1 = source_t[indices], source_t[indices + 1]
+            q0, q1 = source_q[indices], source_q[indices + 1]
+            
+            dt_segment = t1 - t0
+            interp_factor = torch.where(dt_segment > EPSILON, (self.resampled_time_grid - t0) / dt_segment, 0)
+            self.resampled_plane_q[i, :] = q0 + interp_factor * (q1 - q0)
+        print("Hydrograph resampling complete.")
+
+    def _get_plane_inflows_for_group(self, group_id: int, time_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        head_q = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        side_q = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        plane_eids = self.watershed.get_group_config(group_id)['planes']
+        if not plane_eids: return head_q, side_q
+        
+        plane_row_indices = [self.plane_id_to_idx_map[pid] for pid in plane_eids if pid in self.plane_id_to_idx_map]
+        if not plane_row_indices: return head_q, side_q
+
+        q_values_for_planes = self.resampled_plane_q[plane_row_indices, time_idx]
+        
+        q_idx = 0
+        for plane_eid in plane_eids:
+            if plane_eid in self.plane_id_to_idx_map:
+                if self.watershed.get_element_properties(plane_eid).side == 'head':
+                    head_q += q_values_for_planes[q_idx]
+                else:
+                    side_q += q_values_for_planes[q_idx]
+                q_idx += 1
+        return head_q, side_q
+
+    def report_mass_balance(self):
+        if not self.phase1_results:
+            print("Warning: Reporting mass balance without Phase 1 results.")
+            return
+
+        channel_modules = [m for m in self.watershed.element_modules.values() if isinstance(m, ChannelElement_)]
+        final_surface_storage_channels = self._calculate_overall_surface_storage(channel_modules, self.device, self.dtype)
+        final_soil_moisture_storage_channels = self._calculate_overall_soil_moisture_storage(channel_modules, self.device, self.dtype)
+        final_infil_volume_planes, final_infil_volume_channels, final_infil_volume_basin = \
+            self._calculate_total_infiltration_volume(channel_modules, self.device, self.dtype)
         
         final_surface_storage_end = self.phase1_results['final_surface_storage_planes'] + final_surface_storage_channels
         final_soil_moisture_storage_end = self.phase1_results['final_soil_moisture_storage_planes'] + final_soil_moisture_storage_channels
